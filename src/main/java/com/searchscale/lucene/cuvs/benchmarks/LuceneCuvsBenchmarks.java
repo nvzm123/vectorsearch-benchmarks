@@ -62,7 +62,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.nvidia.cuvs.lucene.GPUKnnFloatVectorQuery;
-import com.nvidia.cuvs.lucene.Lucene101AcceleratedHNSWCodec;
+import com.nvidia.cuvs.lucene.Lucene99AcceleratedHNSWVectorsFormat;
 
 public class LuceneCuvsBenchmarks {
 
@@ -616,15 +616,20 @@ public class LuceneCuvsBenchmarks {
   }
 
   private static Codec getCuVSCodec(BenchmarkConfiguration config) {
-    // Use Lucene101AcceleratedHNSWCodec with configurable parameters
+    // Use Lucene99AcceleratedHNSWVectorsFormat with configurable parameters
     // Constructor signature: (cuvsWriterThreads, intGraphDegree, graphDegree, hnswLayers, maxConn, beamWidth)
-    return new Lucene101AcceleratedHNSWCodec(
-        config.cuvsWriterThreads,
-        config.cagraIntermediateGraphDegree,
-        config.cagraGraphDegree,
-        config.cagraHnswLayers,
-        config.hnswMaxConn,
-        config.hnswBeamWidth);
+    return new Lucene101Codec(Mode.BEST_SPEED) {
+      @Override
+      public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
+        return new Lucene99AcceleratedHNSWVectorsFormat(
+            config.cuvsWriterThreads,
+            config.cagraIntermediateGraphDegree,
+            config.cagraGraphDegree,
+            config.cagraHnswLayers,
+            config.hnswMaxConn,
+            config.hnswBeamWidth);
+      }
+    };
   }
 
   // Removed ConfigurableCuVSCodec - using CuVSCPUSearchCodec directly with better error handling
