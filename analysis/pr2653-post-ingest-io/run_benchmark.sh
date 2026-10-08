@@ -796,7 +796,12 @@ if [ -n "$java_pid" ] && cp "/proc/$java_pid/maps" "$runtime_native_maps" 2>/dev
   runtime_map_capture_status=verified
   for library in "$libcuvs" "$libcuvs_c"; do
     read -r device inode size mtime < <(stat -Lc '%d %i %s %Y' "$library")
-    mapping_count=$(grep -Fc " $library" "$runtime_native_maps")
+    map_device=$(python3 -c \
+      'import os, sys; value = os.stat(sys.argv[1]).st_dev; print(f"{os.major(value):x}:{os.minor(value):02x}")' \
+      "$library")
+    mapping_count=$(awk -v path="$library" -v device="$map_device" -v inode="$inode" \
+      '$4 == device && $5 == inode && $6 == path { count++ } END { print count + 0 }' \
+      "$runtime_native_maps")
     if [ "$mapping_count" -eq 0 ]; then
       runtime_map_capture_status=missing_native_mapping
     fi
