@@ -14,6 +14,7 @@
     <maven.compiler.source>22</maven.compiler.source>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+    <cuvs.version>26.12.0</cuvs.version>
   </properties>
 
   <repositories>
@@ -35,12 +36,12 @@
 	<dependency>
 		  <groupId>com.nvidia.cuvs.lucene</groupId>
 		    <artifactId>cuvs-lucene</artifactId>
-		      <version>26.10.0</version>
+		      <version>${cuvs.version}</version>
 		      </dependency>
         <dependency>
             <groupId>com.nvidia.cuvs</groupId>
             <artifactId>cuvs-java</artifactId>
-            <version>26.10.0</version>
+            <version>${cuvs.version}</version>
         </dependency>
         <dependency>
             <groupId>org.apache.lucene</groupId>

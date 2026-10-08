@@ -4,8 +4,10 @@ import com.nvidia.cuvs.CagraIndexParams.CagraGraphBuildAlgo;
 import com.nvidia.cuvs.CagraIndexParams.CodebookGen;
 import com.nvidia.cuvs.CagraIndexParams.CudaDataType;
 import com.nvidia.cuvs.CagraIndexParams.CuvsDistanceType;
+import com.nvidia.cuvs.lucene.AcceleratedHNSWParams;
 import com.searchscale.lucene.cuvs.benchmarks.LuceneCuvsBenchmarks.Codex;
 import java.util.List;
+import org.apache.lucene.index.VectorSimilarityFunction;
 
 public class BenchmarkConfiguration {
 
@@ -15,6 +17,7 @@ public class BenchmarkConfiguration {
   public String vectorColName;
   public int numDocs;
   public int vectorDimension;
+  public VectorSimilarityFunction vectorSimilarityFunction = VectorSimilarityFunction.EUCLIDEAN;
   public String queryFile;
   public int numQueriesToRun;
   public int numWarmUpQueries;
@@ -22,7 +25,10 @@ public class BenchmarkConfiguration {
   public int topK;
   public int numIndexThreads;
   public int cuvsWriterThreads;
+  public int cuvsGraphThreads = 1;
   public int queryThreads;
+  public boolean dropPageCacheBeforeSearch = false;
+  public boolean prewarmIndexBeforeSearch = true;
   public boolean createIndexInMemory;
   public boolean cleanIndexDirectory;
   public boolean saveResultsOnDisk;
@@ -32,6 +38,7 @@ public class BenchmarkConfiguration {
   public String groundTruthFile;
   public String indexDirPath;
   public boolean loadVectorsInMemory;
+  public boolean useLuceneDocIdAsVectorId;
   // Chunk size (MB) for the sequential ChunkedVectorProvider used when loadVectorsInMemory=false.
   public int ingestChunkSizeMB = 64;
   public boolean ingestPrefetch =
@@ -43,12 +50,9 @@ public class BenchmarkConfiguration {
   public int forceMerge;
   public boolean enableTieredMerge;
   public boolean enableIndexWriterInfoStream;
-  // CAGRA_HNSW only: stream vectors straight into a native host matrix during indexing instead of
-  // buffering them as a List<float[]> on the Java heap, halving peak host memory for the build.
-  // Requires a single-segment build (flushFreq >= number of vectors indexed); ignored for other
-  // algorithms. See AcceleratedHNSWParams.withNumInputVectors.
-  public boolean cuvsNativeFlatBuffering;
-
+  public boolean useCompoundFile = true;
+  public boolean useLargeVectorWriteOutput = false;
+  public int largeVectorWriteBufferSizeKB = 1024;
   // Lucene HNSW parameters
   public int hnswMaxConn = 16; // 16 default (max 512)
   public int hnswBeamWidth = 100; // 100 default (max 3200)
@@ -62,6 +66,8 @@ public class BenchmarkConfiguration {
   public int cagraHnswLayers; // layers in CAGRA->HNSW conversion
   public List<Integer> efSearch; // e.g. [64] or [64, 128, 256]
   public CagraGraphBuildAlgo cagraGraphBuildAlgo;
+  public AcceleratedHNSWParams.Strategy cagraIndexParamsStrategy =
+      AcceleratedHNSWParams.Strategy.HEURISTIC;
 
   // CAGRA IVF_PQ parameters
   public int cuVSIvfPqParamsRefinementRate = 1;
@@ -146,6 +152,17 @@ public class BenchmarkConfiguration {
     return List.of(Math.max(topK, (int) Math.ceil(topK * 1.5)));
   }
 
+  public CuvsDistanceType resolvedCuvsDistanceType() {
+    if (vectorSimilarityFunction == null) {
+      throw new IllegalArgumentException("vectorSimilarityFunction must not be null");
+    }
+    return switch (vectorSimilarityFunction) {
+      case EUCLIDEAN -> CuvsDistanceType.L2Expanded;
+      case DOT_PRODUCT, MAXIMUM_INNER_PRODUCT -> CuvsDistanceType.InnerProduct;
+      case COSINE -> CuvsDistanceType.CosineExpanded;
+    };
+  }
+
   public String prettyString() {
     StringBuilder sb = new StringBuilder();
     sb.append("Benchmark ID: ").append(benchmarkID).append('\n');
@@ -154,6 +171,8 @@ public class BenchmarkConfiguration {
     sb.append("Name of the vector field is: ").append(vectorColName).append('\n');
     sb.append("Number of documents to be indexed are: ").append(numDocs).append('\n');
     sb.append("Number of dimensions are: ").append(vectorDimension).append('\n');
+    sb.append("Vector similarity function: ").append(vectorSimilarityFunction).append('\n');
+    sb.append("Resolved cuVS distance type: ").append(resolvedCuvsDistanceType()).append('\n');
     sb.append("Query file used is: ").append(queryFile).append('\n');
     sb.append("Number of queries to run: ").append(numQueriesToRun).append('\n');
     sb.append("Number of warmup queries: ").append(numWarmUpQueries).append('\n');
@@ -161,6 +180,8 @@ public class BenchmarkConfiguration {
     sb.append("TopK value is: ").append(topK).append('\n');
     sb.append("numIndexThreads is: ").append(numIndexThreads).append('\n');
     sb.append("Query threads: ").append(queryThreads).append('\n');
+    sb.append("Drop page cache before search: ").append(dropPageCacheBeforeSearch).append('\n');
+    sb.append("Prewarm index before search: ").append(prewarmIndexBeforeSearch).append('\n');
     sb.append("Create index in memory: ").append(createIndexInMemory).append('\n');
     sb.append("Clean index directory: ").append(cleanIndexDirectory).append('\n');
     sb.append("Save results on disk: ").append(saveResultsOnDisk).append('\n');
@@ -169,6 +190,7 @@ public class BenchmarkConfiguration {
     sb.append("Ground Truth file used is: ").append(groundTruthFile).append('\n');
     sb.append("index directory path is: ").append(indexDirPath).append('\n');
     sb.append("Load vectors in memory before indexing: ").append(loadVectorsInMemory).append('\n');
+    sb.append("Use Lucene doc ID as vector ID: ").append(useLuceneDocIdAsVectorId).append('\n');
     sb.append("Ingest chunk size (MB): ").append(ingestChunkSizeMB).append('\n');
     sb.append("Skip indexing (and use existing index for search): ")
         .append(skipIndexing)
@@ -177,6 +199,11 @@ public class BenchmarkConfiguration {
         .append(forceMerge)
         .append('\n');
     sb.append("Enable TieredMerge: ").append(enableTieredMerge).append('\n');
+    sb.append("Use compound file: ").append(useCompoundFile).append('\n');
+    sb.append("Use large vector write output: ").append(useLargeVectorWriteOutput).append('\n');
+    sb.append("Large vector write buffer (KiB): ")
+        .append(largeVectorWriteBufferSizeKB)
+        .append('\n');
     sb.append("Num HNSW merge threads: ").append(hnswMergeThreads).append('\n');
     sb.append("enableIndexWriterInfoStream: ").append(enableIndexWriterInfoStream).append('\n');
     sb.append("efSearch: ").append(getEfSearchValues()).append('\n');
@@ -199,10 +226,12 @@ public class BenchmarkConfiguration {
       sb.append("cagraIntermediateGraphDegree: ").append(cagraIntermediateGraphDegree).append('\n');
       sb.append("cagraGraphDegree: ").append(cagraGraphDegree).append('\n');
       sb.append("cuvsWriterThreads: ").append(cuvsWriterThreads).append('\n');
+      sb.append("cuvsGraphThreads: ").append(cuvsGraphThreads).append('\n');
       sb.append("cagraITopK: ").append(cagraITopK).append('\n');
       sb.append("cagraSearchWidth: ").append(cagraSearchWidth).append('\n');
       sb.append("cagraHnswLayers: ").append(cagraHnswLayers).append('\n');
       sb.append("cagraGraphBuildAlgo: ").append(cagraGraphBuildAlgo).append('\n');
+      sb.append("cagraIndexParamsStrategy: ").append(cagraIndexParamsStrategy).append('\n');
     }
     return sb.toString();
   }

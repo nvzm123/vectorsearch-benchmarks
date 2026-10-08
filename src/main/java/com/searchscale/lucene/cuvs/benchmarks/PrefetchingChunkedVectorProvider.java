@@ -3,6 +3,7 @@ package com.searchscale.lucene.cuvs.benchmarks;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
@@ -27,6 +28,8 @@ public class PrefetchingChunkedVectorProvider implements VectorProvider {
 
   private static final Logger log =
       LoggerFactory.getLogger(PrefetchingChunkedVectorProvider.class.getName());
+  private static final boolean USE_BULK_ROW_COPY =
+      !Boolean.getBoolean("cuvs.benchmark.scalarVectorRowCopy");
 
   private enum Format {
     FBIN,
@@ -35,11 +38,19 @@ public class PrefetchingChunkedVectorProvider implements VectorProvider {
 
   private static final class Chunk {
     final ByteBuffer buf;
+    final FloatBuffer floats;
     final long start;
     final int len;
 
     Chunk(ByteBuffer buf, long start, int len) {
       this.buf = buf;
+      if (buf == null) {
+        this.floats = null;
+      } else {
+        ByteBuffer filled = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+        filled.flip();
+        this.floats = filled.asFloatBuffer();
+      }
       this.start = start;
       this.len = len;
     }
@@ -129,13 +140,12 @@ public class PrefetchingChunkedVectorProvider implements VectorProvider {
 
     // Two reusable direct buffers: the reader fills one while the consumer drains the other.
     for (int i = 0; i < 2; i++) {
-      free.add(
-          ByteBuffer.allocateDirect(chunkVectors * vectorSize).order(ByteOrder.LITTLE_ENDIAN));
+      free.add(ByteBuffer.allocateDirect(chunkVectors * vectorSize).order(ByteOrder.LITTLE_ENDIAN));
     }
 
     log.info(
-        "PrefetchingChunkedVectorProvider: {} vectors, {} dims, format {}, {} vectors/chunk (~{} MB),"
-            + " double-buffered prefetch",
+        "PrefetchingChunkedVectorProvider: {} vectors, {} dims, format {}, {} vectors/chunk (~{}"
+            + " MB), double-buffered prefetch",
         vectorCount - firstVector,
         dimension,
         format,
@@ -223,9 +233,14 @@ public class PrefetchingChunkedVectorProvider implements VectorProvider {
               + current.start);
     }
     int base = (int) (index - current.start) * vectorSize + prefixBytes;
-    for (int i = 0; i < dimension; i++) {
-      dst[i] = current.buf.getFloat(base + i * 4);
+    if (!USE_BULK_ROW_COPY || dst.length < dimension) {
+      // Preserve the existing partial-copy behavior and exception type for an invalid destination.
+      for (int i = 0; i < dimension; i++) {
+        dst[i] = current.buf.getFloat(base + i * Float.BYTES);
+      }
+      return;
     }
+    current.floats.get(base / Float.BYTES, dst, 0, dimension);
   }
 
   /** Reads until {@code buf} is full, starting at file {@code position} (absolute, positional). */

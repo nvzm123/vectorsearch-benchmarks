@@ -1,16 +1,19 @@
 package com.searchscale.lucene.cuvs.benchmarks;
 
-import static org.apache.lucene.index.VectorSimilarityFunction.EUCLIDEAN;
-
 import com.nvidia.cuvs.CagraIndexParams.CagraGraphBuildAlgo;
+import com.nvidia.cuvs.CagraIndexParams.CudaDataType;
+import com.nvidia.cuvs.CagraIndexParams.CuvsDistanceType;
+import com.nvidia.cuvs.CuVSIvfPqIndexParams;
+import com.nvidia.cuvs.CuVSIvfPqParams;
+import com.nvidia.cuvs.CuVSIvfPqSearchParams;
 import com.nvidia.cuvs.lucene.AcceleratedHNSWParams;
-import com.nvidia.cuvs.spi.CuVSProvider;
 import com.nvidia.cuvs.lucene.CuVS2510GPUSearchCodec;
 import com.nvidia.cuvs.lucene.GPUKnnFloatVectorQuery;
 import com.nvidia.cuvs.lucene.GPUSearchParams;
 import com.nvidia.cuvs.lucene.Lucene101AcceleratedHNSWCodec;
 import com.nvidia.cuvs.lucene.LuceneAcceleratedHNSWBinaryQuantizedCodec;
 import com.nvidia.cuvs.lucene.LuceneAcceleratedHNSWScalarQuantizedCodec;
+import com.nvidia.cuvs.spi.CuVSProvider;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
@@ -20,6 +23,7 @@ import java.nio.file.FileVisitOption;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -27,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -75,6 +80,8 @@ import org.slf4j.LoggerFactory;
 public class LuceneCuvsBenchmarks {
 
   private static final Logger log = LoggerFactory.getLogger(LuceneCuvsBenchmarks.class.getName());
+  private static final String PROACTIVE_SYNC_READY_FILE_PROPERTY =
+      "cuvs.proactiveVectorSyncReadyFile";
   private static ExecutorService executorService = null;
 
   public enum Codex {
@@ -83,6 +90,95 @@ public class LuceneCuvsBenchmarks {
     CAGRA_SEARCH,
     CAGRA_HNSW_BINARY,
     CAGRA_HNSW_SCALAR
+  }
+
+  static KnnFloatVectorField createVectorField(BenchmarkConfiguration config, float[] vector) {
+    return new KnnFloatVectorField(config.vectorColName, vector, config.vectorSimilarityFunction);
+  }
+
+  static Document createDocument(BenchmarkConfiguration config, int id, float[] vector) {
+    Document document = new Document();
+    if (!config.useLuceneDocIdAsVectorId) {
+      document.add(new StringField("id", String.valueOf(id), Field.Store.YES));
+    }
+    document.add(createVectorField(config, vector));
+    return document;
+  }
+
+  static int resolveVectorId(
+      BenchmarkConfiguration config, int luceneDocId, String storedVectorId) {
+    if (config.useLuceneDocIdAsVectorId) {
+      return luceneDocId;
+    }
+    if (storedVectorId == null) {
+      throw new IllegalStateException("Missing stored vector ID");
+    }
+    return Integer.parseInt(storedVectorId);
+  }
+
+  static boolean requiresGpuInitialization(BenchmarkConfiguration config) {
+    if (config.isCagraSearch()) {
+      return true;
+    }
+    return !config.skipIndexing
+        && (config.isCagra() || config.isCagraHNSWBinary() || config.isCagraHNSWScalar());
+  }
+
+  static void validateMetricConfiguration(BenchmarkConfiguration config) {
+    CuvsDistanceType expected = config.resolvedCuvsDistanceType();
+    if (config.cagraIndexParamsStrategy == AcceleratedHNSWParams.Strategy.CUSTOM
+        && config.cagraGraphBuildAlgo == CagraGraphBuildAlgo.IVF_PQ
+        && config.cuVSIvfPqIndexParamsMetric != expected) {
+      throw new IllegalArgumentException(
+          "CUSTOM IVF-PQ metric must match vectorSimilarityFunction: expected "
+              + expected
+              + " but got "
+              + config.cuVSIvfPqIndexParamsMetric);
+    }
+    if (config.cagraIndexParamsStrategy != AcceleratedHNSWParams.Strategy.CUSTOM) {
+      config.cuVSIvfPqIndexParamsMetric = expected;
+    }
+    if (config.useLargeVectorWriteOutput && config.useCompoundFile) {
+      throw new IllegalArgumentException(
+          "useLargeVectorWriteOutput requires useCompoundFile=false");
+    }
+    if (config.largeVectorWriteBufferSizeKB < 1
+        || config.largeVectorWriteBufferSizeKB > 64 * 1024) {
+      throw new IllegalArgumentException(
+          "largeVectorWriteBufferSizeKB must be between 1 and 65536");
+    }
+  }
+
+  static Directory openIndexDirectory(BenchmarkConfiguration config, Path path) throws IOException {
+    FSDirectory fsDirectory = FSDirectory.open(path);
+    Directory output = fsDirectory;
+    if (config.useLargeVectorWriteOutput) {
+      int bufferBytes = Math.multiplyExact(config.largeVectorWriteBufferSizeKB, 1024);
+      output = new LargeVectorWriteDirectory(fsDirectory, bufferBytes);
+    }
+    return new SyncTimingDirectory(output);
+  }
+
+  static void writeIngestCompleteMarker(Path marker, int indexedDocuments) throws IOException {
+    Path parent = marker.toAbsolutePath().getParent();
+    if (parent != null) {
+      Files.createDirectories(parent);
+    }
+    String contents =
+        "ingest_complete_epoch_ms\tindexed_documents\n"
+            + System.currentTimeMillis()
+            + "\t"
+            + indexedDocuments
+            + "\n";
+    Files.writeString(marker, contents, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+  }
+
+  private static void signalIngestComplete(int indexedDocuments) throws IOException {
+    String marker = System.getProperty(PROACTIVE_SYNC_READY_FILE_PROPERTY);
+    if (marker == null || marker.isBlank()) {
+      return;
+    }
+    writeIngestCompleteMarker(Path.of(marker), indexedDocuments);
   }
 
   /**
@@ -189,6 +285,7 @@ public class LuceneCuvsBenchmarks {
 
     BenchmarkConfiguration config =
         Util.newObjectMapper().readValue(new File(args[0]), BenchmarkConfiguration.class);
+    validateMetricConfiguration(config);
 
     // Override benchmarkID if provided as command line argument
     if (args.length >= 2) {
@@ -307,11 +404,9 @@ public class LuceneCuvsBenchmarks {
 
     try {
       // [2] Benchmarking setup
-      // Enable RMM async memory pool for GPU algorithms (CAGRA_HNSW, CAGRA_SEARCH,
-      // CAGRA_HNSW_BINARY, CAGRA_HNSW_SCALAR). Must NOT be called for LUCENE_HNSW: that path
-      // never loads the cuVS native library, so CuVSProvider resolves to UnsupportedProvider
-      // and throws.
-      if (config.isCagra() || config.isCagraSearch() || config.isCagraHNSWBinary() || config.isCagraHNSWScalar()) {
+      // CAGRA_HNSW variants need the GPU while building, but their retained Lucene HNSW indexes
+      // search on the CPU. CAGRA_SEARCH needs the GPU during search as well.
+      if (requiresGpuInitialization(config)) {
         CuVSProvider.provider().enableRMMAsyncMemory();
       }
       if (!config.skipIndexing) {
@@ -321,7 +416,8 @@ public class LuceneCuvsBenchmarks {
         // land in one segment (flushFreq >= numDocs) and no merge is requested. K sequential passes
         // each build one segment from a contiguous slice, so peak host memory stays at one slice's
         // native buffer; K=1 reduces to the single-segment path. This enables native flat buffering
-        // and prefetch per segment, which the concurrent multi-thread path cannot (see buildSegment).
+        // and prefetch per segment, which the concurrent multi-thread path cannot (see
+        // buildSegment).
         // Scoped to CAGRA_HNSW: sequential passes are free here because the GPU serializes builds
         // anyway. For a CPU build (LUCENE_HNSW) they would lose cross-segment parallelism.
         boolean partitioned =
@@ -357,6 +453,7 @@ public class LuceneCuvsBenchmarks {
           // HNSW Writer:
           IndexWriterConfig indexWriterConfig = new IndexWriterConfig(new StandardAnalyzer());
           indexWriterConfig.setCodec(getCodec(config, numVectorsToIndex));
+          indexWriterConfig.setUseCompoundFile(config.useCompoundFile);
           indexWriterConfig.setMaxBufferedDocs(config.flushFreq);
           indexWriterConfig.setRAMBufferSizeMB(IndexWriterConfig.DISABLE_AUTO_FLUSH);
 
@@ -378,23 +475,21 @@ public class LuceneCuvsBenchmarks {
           // Use reflection to bypass the 2048MB per-thread limit and set it to 60GB
           setPerThreadRAMLimit(indexWriterConfig, 61440); // 60GB per thread
           log.info(
-              "Configured HNSW writer - MaxBufferedDocs: {}, RAMBufferSizeMB: {}, PerThreadRAMLimit:"
-                  + " {} MB",
+              "Configured HNSW writer - MaxBufferedDocs: {}, RAMBufferSizeMB: {},"
+                  + " PerThreadRAMLimit: {} MB",
               config.flushFreq,
               indexWriterConfig.getRAMBufferSizeMB(),
               indexWriterConfig.getRAMPerThreadHardLimitMB());
 
-          if (!config.createIndexInMemory) {
-            Path hnswIndex = Path.of(config.indexDirPath);
-            writer =
-                new IndexWriter(
-                    new SyncTimingDirectory(FSDirectory.open(hnswIndex)), indexWriterConfig);
-          } else {
-            writer = new IndexWriter(new ByteBuffersDirectory(), indexWriterConfig);
-          }
-
           if (config.enableIndexWriterInfoStream) {
             indexWriterConfig.setInfoStream(new PrintStreamInfoStream(System.out));
+          }
+
+          if (!config.createIndexInMemory) {
+            Path hnswIndex = Path.of(config.indexDirPath);
+            writer = new IndexWriter(openIndexDirectory(config, hnswIndex), indexWriterConfig);
+          } else {
+            writer = new IndexWriter(new ByteBuffersDirectory(), indexWriterConfig);
           }
 
           log.info(
@@ -405,6 +500,7 @@ public class LuceneCuvsBenchmarks {
         long indexTimeTaken = System.currentTimeMillis() - indexStartTime;
 
         metrics.put(config.algoToRun + "-indexing-time", indexTimeTaken);
+        StageTimers.appendMetrics(metrics, "benchmark-stage");
         log.info("Time taken for index building (end to end): {} ms", indexTimeTaken);
 
         try {
@@ -457,8 +553,12 @@ public class LuceneCuvsBenchmarks {
         log.info("--- Running search with efSearch={} ---", efSearch);
 
         // ── Deterministic cache state for each efSearch run ──────────────────
-        dropPageCache();
-        prewarmIndex(config.indexDirPath);
+        if (config.dropPageCacheBeforeSearch) {
+          dropPageCache();
+        }
+        if (config.prewarmIndexBeforeSearch) {
+          prewarmIndex(config.indexDirPath);
+        }
 
         // Fresh collections for this efSearch run
         List<QueryResult> efSearchQueryResults =
@@ -554,7 +654,7 @@ public class LuceneCuvsBenchmarks {
     }
   }
 
-  private static void indexDocuments(
+  static void indexDocuments(
       IndexWriter writer,
       BenchmarkConfiguration config,
       List<String> titles,
@@ -575,51 +675,51 @@ public class LuceneCuvsBenchmarks {
     // The prefetch provider unpacks directly into a caller-reused array (safe: the writer copies
     // each vector eagerly at addValue). Other providers keep returning fresh arrays.
     final boolean reuseScratch = vectorProvider instanceof PrefetchingChunkedVectorProvider;
+    List<Future<?>> ingestTasks = new ArrayList<>(threads);
     for (int i = 0; i < threads; i++) {
-      pool.submit(
-          () -> {
-            float[] scratch = reuseScratch ? new float[config.vectorDimension] : null;
-            while (true) {
-              int id = numDocsIndexed.getAndIncrement();
-              if (id >= numDocsToIndex) {
-                break; // done
-              }
-              float[] vector;
-              try {
-                if (reuseScratch) {
-                  vectorProvider.get(id, scratch);
-                  vector = scratch;
-                } else {
-                  vector = Objects.requireNonNull(vectorProvider.get(id));
+      ingestTasks.add(
+          pool.submit(
+              () -> {
+                float[] scratch = reuseScratch ? new float[config.vectorDimension] : null;
+                while (true) {
+                  int id = numDocsIndexed.getAndIncrement();
+                  if (id >= numDocsToIndex) {
+                    break; // done
+                  }
+                  float[] vector;
+                  try {
+                    if (reuseScratch) {
+                      vectorProvider.get(id, scratch);
+                      vector = scratch;
+                    } else {
+                      vector = Objects.requireNonNull(vectorProvider.get(id));
+                    }
+                  } catch (IOException e) {
+                    throw new UncheckedIOException("Failed to read vector at index " + id, e);
+                  }
+                  Document doc = createDocument(config, id, vector);
+                  try {
+                    writer.addDocument(doc);
+                    if ((id + 1) % 25000 == 0) {
+                      log.info(
+                          "Done indexing {} documents. Pending docs: {}",
+                          (id + 1),
+                          writer.getPendingNumDocs());
+                    }
+                    // Log when we expect a flush
+                    if ((id + 1) == config.flushFreq || (id + 1) == 2 * config.flushFreq) {
+                      log.info("Expected flush point reached at {} documents", (id + 1));
+                    }
+                  } catch (IOException ex) {
+                    throw new UncheckedIOException(ex);
+                  }
                 }
-              } catch (IOException e) {
-                throw new UncheckedIOException("Failed to read vector at index " + id, e);
-              }
-              Document doc = new Document();
-              doc.add(new StringField("id", String.valueOf(id), Field.Store.YES));
-              doc.add(new KnnFloatVectorField(config.vectorColName, vector, EUCLIDEAN));
-              try {
-                writer.addDocument(doc);
-                if ((id + 1) % 25000 == 0) {
-                  log.info(
-                      "Done indexing {} documents. Pending docs: {}",
-                      (id + 1),
-                      writer.getPendingNumDocs());
-                }
-                // Log when we expect a flush
-                if ((id + 1) == config.flushFreq || (id + 1) == 2 * config.flushFreq) {
-                  log.info("Expected flush point reached at {} documents", (id + 1));
-                }
-              } catch (IOException ex) {
-                throw new UncheckedIOException(ex);
-              }
-            }
-          });
+              }));
     }
-    pool.shutdown();
-    pool.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
+    awaitIngestTasks(pool, ingestTasks);
     long ingestBytes = (long) numDocsToIndex * config.vectorDimension * Float.BYTES;
     StageTimers.stop("ingest [DISK+CPU]", ingestStart, ingestBytes);
+    signalIngestComplete(numDocsToIndex);
 
     if (config.forceMerge > 0) {
       log.info("Force merge is enabled, force merging into " + config.forceMerge + " segments");
@@ -635,6 +735,46 @@ public class LuceneCuvsBenchmarks {
     long closeStart = StageTimers.start();
     writer.close();
     StageTimers.stop("close [DISK; finalize]", closeStart);
+  }
+
+  static void awaitIngestTasks(ExecutorService pool, List<? extends Future<?>> tasks)
+      throws IOException, InterruptedException {
+    pool.shutdown();
+    Throwable firstFailure = null;
+    try {
+      for (Future<?> task : tasks) {
+        try {
+          task.get();
+        } catch (ExecutionException e) {
+          if (firstFailure == null) {
+            firstFailure = e.getCause();
+          }
+        }
+      }
+    } catch (InterruptedException e) {
+      for (Future<?> task : tasks) {
+        task.cancel(true);
+      }
+      pool.shutdownNow();
+      Thread.currentThread().interrupt();
+      throw e;
+    }
+
+    if (firstFailure instanceof UncheckedIOException uncheckedIOException) {
+      throw uncheckedIOException.getCause();
+    }
+    if (firstFailure instanceof IOException ioException) {
+      throw ioException;
+    }
+    if (firstFailure instanceof RuntimeException runtimeException) {
+      throw runtimeException;
+    }
+    if (firstFailure instanceof Error error) {
+      throw error;
+    }
+    if (firstFailure != null) {
+      throw new RuntimeException("Ingest worker failed", firstFailure);
+    }
   }
 
   /**
@@ -653,7 +793,7 @@ public class LuceneCuvsBenchmarks {
         numVectorsToIndex);
     // One directory shared across all K passes: its sync-once tracking skips re-fsyncing prior
     // segments that each fresh per-pass IndexWriter would otherwise re-sync (O(K^2) -> O(K)).
-    try (Directory dir = new SyncTimingDirectory(FSDirectory.open(Path.of(config.indexDirPath)))) {
+    try (Directory dir = openIndexDirectory(config, Path.of(config.indexDirPath))) {
       int base = numVectorsToIndex / k;
       int rem = numVectorsToIndex % k;
       int start = 0;
@@ -814,12 +954,16 @@ public class LuceneCuvsBenchmarks {
       throws Exception {
     IndexWriterConfig iwc = new IndexWriterConfig(new StandardAnalyzer());
     iwc.setCodec(getCodec(config, sliceSize)); // numInputVectors = sliceSize for this segment
+    iwc.setUseCompoundFile(config.useCompoundFile);
     iwc.setMaxBufferedDocs(config.flushFreq);
     iwc.setRAMBufferSizeMB(IndexWriterConfig.DISABLE_AUTO_FLUSH);
     iwc.setMergePolicy(NoMergePolicy.INSTANCE);
     iwc.setOpenMode(
         createNew ? IndexWriterConfig.OpenMode.CREATE : IndexWriterConfig.OpenMode.APPEND);
     setPerThreadRAMLimit(iwc, 61440); // 60GB per thread
+    if (config.enableIndexWriterInfoStream) {
+      iwc.setInfoStream(new PrintStreamInfoStream(System.out));
+    }
 
     IndexWriter writer = new IndexWriter(directory, iwc);
     boolean reuseScratch = vectorProvider instanceof PrefetchingChunkedVectorProvider;
@@ -839,16 +983,18 @@ public class LuceneCuvsBenchmarks {
         } catch (IOException e) {
           throw new UncheckedIOException("Failed to read vector at index " + id, e);
         }
-        Document doc = new Document();
-        doc.add(new StringField("id", String.valueOf(id), Field.Store.YES));
-        doc.add(new KnnFloatVectorField(config.vectorColName, vector, EUCLIDEAN));
+        Document doc = createDocument(config, id, vector);
         writer.addDocument(doc);
         if ((id + 1) % 25000 == 0) {
-          log.info("Done indexing {} documents. Pending docs: {}", id + 1, writer.getPendingNumDocs());
+          log.info(
+              "Done indexing {} documents. Pending docs: {}", id + 1, writer.getPendingNumDocs());
         }
       }
       StageTimers.stop(
-          "ingest [DISK+CPU]", ingestStart, (long) sliceSize * config.vectorDimension * Float.BYTES);
+          "ingest [DISK+CPU]",
+          ingestStart,
+          (long) sliceSize * config.vectorDimension * Float.BYTES);
+      signalIngestComplete(sliceSize);
       if (gpuCommitPermit != null) {
         gpuCommitPermit.acquire(); // serialize the GPU build across concurrent segment pipelines
       }
@@ -890,24 +1036,28 @@ public class LuceneCuvsBenchmarks {
     try (IndexReader indexReader = DirectoryReader.open(directory)) {
       IndexSearcher indexSearcher = new IndexSearcher(indexReader);
 
-      IndexTreeList<float[]> queries;
+      List<float[]> queries;
       String queryMapdbFile = config.queryFile + ".mapdb";
 
-      if (new File(queryMapdbFile).exists() == false) {
+      if (isExplicitBinaryQueryFile(config.queryFile)) {
+        queries = readExplicitBinaryQueries(config.queryFile, config.numQueriesToRun);
+        log.info("Read {} queries directly from {}", queries.size(), config.queryFile);
+      } else if (!isLegacyCachedQueryFile(config.queryFile)) {
+        throw new IllegalArgumentException("Unsupported query file: " + config.queryFile);
+      } else if (new File(queryMapdbFile).exists() == false) {
         log.info("No mapdb file found for queries. Reading source files to build one ...");
         db = DBMaker.fileDB(queryMapdbFile).make();
-        queries = db.indexTreeList("vectors", SERIALIZER.FLOAT_ARRAY).createOrOpen();
+        IndexTreeList<float[]> cachedQueries =
+            db.indexTreeList("vectors", SERIALIZER.FLOAT_ARRAY).createOrOpen();
+        queries = cachedQueries;
 
         if (config.queryFile.endsWith(".csv")) {
           for (String line :
               FileUtils.readFileToString(new File(config.queryFile), "UTF-8").split("\n")) {
             queries.add(Util.parseFloatArrayFromStringArray(line));
           }
-        } else if (config.queryFile.contains("fvecs")) {
-          FBIvecsReader.readFvecs(config.queryFile, -1, queries);
-        } else if (config.queryFile.contains("fbin")) {
-          FBIvecsReader.readFbin(config.queryFile, -1, queries);
-        } else if (config.queryFile.contains("bvecs")) {
+        } else if (config.queryFile.endsWith(".bvecs")
+            || config.queryFile.endsWith(".bvecs.gz")) {
           FBIvecsReader.readBvecs(config.queryFile, -1, queries);
         }
         log.info("Mapdb file created with {} number of queries", queries.size());
@@ -917,6 +1067,7 @@ public class LuceneCuvsBenchmarks {
         queries = db.indexTreeList("vectors", SERIALIZER.FLOAT_ARRAY).createOrOpen();
         log.info("{} queries available from the mapdb file", queries.size());
       }
+      validateQueries(queries, config.numQueriesToRun, config.vectorDimension, config.queryFile);
 
       ExecutorService pool = Executors.newFixedThreadPool(config.queryThreads);
       AtomicInteger queriesFinished = new AtomicInteger(0);
@@ -1000,8 +1151,12 @@ public class LuceneCuvsBenchmarks {
                   for (int i = 0; i < numResultsToTake; i++) {
                     ScoreDoc hit = hits[i];
                     try {
-                      Document d = indexReader.storedFields().document(hit.doc);
-                      neighbors.add(Integer.parseInt(d.get("id")));
+                      String storedVectorId = null;
+                      if (!config.useLuceneDocIdAsVectorId) {
+                        Document d = indexReader.storedFields().document(hit.doc);
+                        storedVectorId = d.get("id");
+                      }
+                      neighbors.add(resolveVectorId(config, hit.doc, storedVectorId));
                     } catch (IOException e) {
                       e.printStackTrace();
                     }
@@ -1106,6 +1261,132 @@ public class LuceneCuvsBenchmarks {
     }
   }
 
+  static boolean isExplicitBinaryQueryFile(String queryFile) {
+    return queryFile.endsWith(".fbin")
+        || queryFile.endsWith(".fvecs")
+        || queryFile.endsWith(".fvecs.gz");
+  }
+
+  private static boolean isLegacyCachedQueryFile(String queryFile) {
+    return queryFile.endsWith(".csv")
+        || queryFile.endsWith(".bvecs")
+        || queryFile.endsWith(".bvecs.gz");
+  }
+
+  static List<float[]> readExplicitBinaryQueries(String queryFile, int requiredCount) {
+    if (!isExplicitBinaryQueryFile(queryFile)) {
+      throw new IllegalArgumentException("Not an explicit binary query file: " + queryFile);
+    }
+    List<float[]> queries = new ArrayList<>();
+    if (queryFile.endsWith(".fbin")) {
+      FBIvecsReader.readFbin(queryFile, requiredCount, queries);
+    } else {
+      FBIvecsReader.readFvecs(queryFile, requiredCount, queries);
+    }
+    return queries;
+  }
+
+  static void validateQueries(
+      List<float[]> queries, int requiredCount, int expectedDimension, String queryFile) {
+    if (queries.size() < requiredCount) {
+      throw new IllegalArgumentException(
+          "Query file "
+              + queryFile
+              + " contains "
+              + queries.size()
+              + " vectors; "
+              + requiredCount
+              + " required");
+    }
+    for (int i = 0; i < queries.size(); i++) {
+      if (queries.get(i).length != expectedDimension) {
+        throw new IllegalArgumentException(
+            "Query "
+                + i
+                + " in "
+                + queryFile
+                + " has dimension "
+                + queries.get(i).length
+                + "; expected "
+                + expectedDimension);
+      }
+    }
+  }
+
+  static CuVSIvfPqParams buildCustomIvfPqParams(
+      BenchmarkConfiguration config, int numVectorsToIndex) {
+    validateCustomIvfPqParams(config, numVectorsToIndex);
+    CuVSIvfPqIndexParams indexParams =
+        new CuVSIvfPqIndexParams.Builder()
+            .withMetric(config.cuVSIvfPqIndexParamsMetric)
+            .withMetricArg(config.cuVSIvfPqIndexParamsMetricArg)
+            .withAddDataOnBuild(config.cuVSIvfPqIndexParamsAddDataOnBuild)
+            .withNLists(config.cuVSIvfPqIndexParamsNLists)
+            .withKmeansNIters(config.cuVSIvfPqIndexParamsKmeansNIters)
+            .withKmeansTrainsetFraction(config.cuVSIvfPqIndexParamsKmeansTrainsetFraction)
+            .withPqBits(config.cuVSIvfPqIndexParamsPqBits)
+            .withPqDim(config.cuVSIvfPqIndexParamsPqDim)
+            .withCodebookKind(config.cuVSIvfPqIndexParamsCodebookKind)
+            .withForceRandomRotation(config.cuVSIvfPqIndexParamsForceRandomRotation)
+            .withConservativeMemoryAllocation(
+                config.cuVSIvfPqIndexParamsConservativeMemoryAllocation)
+            .withMaxTrainPointsPerPqCode(config.cuVSIvfPqIndexParamsMaxTrainPointsPerPqCode)
+            .build();
+    CuVSIvfPqSearchParams searchParams =
+        new CuVSIvfPqSearchParams.Builder()
+            .withNProbes(config.cuVSIvfPqSearchParamsNProbes)
+            .withLutDtype(config.cuVSIvfPqSearchParamsLutDtype)
+            .withInternalDistanceDtype(config.cuVSIvfPqSearchParamsInternalDistanceDtype)
+            .withPreferredShmemCarveout(config.cuVSIvfPqSearchParamsPreferredShmemCarveout)
+            .build();
+    return new CuVSIvfPqParams.Builder()
+        .withCuVSIvfPqIndexParams(indexParams)
+        .withCuVSIvfPqSearchParams(searchParams)
+        .withRefinementRate(config.cuVSIvfPqParamsRefinementRate)
+        .build();
+  }
+
+  private static void validateCustomIvfPqParams(
+      BenchmarkConfiguration config, int numVectorsToIndex) {
+    if (config.cuVSIvfPqIndexParamsMetric != config.resolvedCuvsDistanceType()) {
+      throw new IllegalArgumentException(
+          "CUSTOM IVF-PQ metric must match vectorSimilarityFunction");
+    }
+    if (config.cuVSIvfPqIndexParamsNLists < 1
+        || config.cuVSIvfPqIndexParamsNLists > numVectorsToIndex) {
+      throw new IllegalArgumentException("IVF-PQ nLists must be within the indexed vector count");
+    }
+    if (config.cuVSIvfPqSearchParamsNProbes < 1
+        || config.cuVSIvfPqSearchParamsNProbes > config.cuVSIvfPqIndexParamsNLists) {
+      throw new IllegalArgumentException("IVF-PQ nProbes must be between 1 and nLists");
+    }
+    if (config.cuVSIvfPqIndexParamsPqBits < 4
+        || config.cuVSIvfPqIndexParamsPqBits > 8
+        || config.cuVSIvfPqIndexParamsPqDim < 0
+        || ((long) config.cuVSIvfPqIndexParamsPqDim * config.cuVSIvfPqIndexParamsPqBits) % 8 != 0) {
+      throw new IllegalArgumentException("Invalid IVF-PQ pqBits/pqDim combination");
+    }
+    if (!Double.isFinite(config.cuVSIvfPqIndexParamsKmeansTrainsetFraction)
+        || config.cuVSIvfPqIndexParamsKmeansTrainsetFraction <= 0.0
+        || config.cuVSIvfPqIndexParamsKmeansTrainsetFraction > 1.0) {
+      throw new IllegalArgumentException("IVF-PQ training fraction must be in (0, 1]");
+    }
+    if (config.cuVSIvfPqIndexParamsKmeansNIters < 1
+        || config.cuVSIvfPqIndexParamsMaxTrainPointsPerPqCode < 1
+        || config.cuVSIvfPqParamsRefinementRate < 1) {
+      throw new IllegalArgumentException(
+          "IVF-PQ iteration, training, and refinement values must be positive");
+    }
+    if (!config.cuVSIvfPqIndexParamsAddDataOnBuild) {
+      throw new IllegalArgumentException("CAGRA graph construction requires addDataOnBuild=true");
+    }
+    if (config.cuVSIvfPqSearchParamsLutDtype == CudaDataType.CUDA_R_32F
+        && config.cuVSIvfPqSearchParamsInternalDistanceDtype == CudaDataType.CUDA_R_16F) {
+      throw new IllegalArgumentException(
+          "Internal distance dtype cannot be narrower than LUT dtype");
+    }
+  }
+
   private static Codec getCodec(BenchmarkConfiguration config, int numVectorsToIndex)
       throws Exception {
     if (config.algoToRun.equals(Codex.LUCENE_HNSW)) {
@@ -1129,17 +1410,13 @@ public class LuceneCuvsBenchmarks {
         }
       };
     } else {
-      // Delegate IVF-PQ parameter selection to CagraIndexParamsFactory by using HEURISTIC mode.
-      // The codec calls CagraIndexParamsFactory.create(params, rows, dimension) internally and
-      // auto-tunes the IVF-PQ params from the actual row count and vector dimension at build time.
-      //
-      // The build algo defaults to the factory's row-count choice (NN_DESCENT <5M, IVF_PQ >=5M),
-      // unless cagraGraphBuildAlgo is set to IVF_PQ or NN_DESCENT to force it (AUTO_SELECT keeps the
-      // row-count default). Params stay auto-tuned regardless. The other IVF-PQ knobs remain dead in
-      // HEURISTIC mode: cuVSIvfPqIndexParams*, cuVSIvfPqSearchParams*, cuVSIvfPqParamsRefinementRate.
+      AcceleratedHNSWParams.Strategy strategy =
+          config.cagraIndexParamsStrategy != null
+              ? config.cagraIndexParamsStrategy
+              : AcceleratedHNSWParams.Strategy.HEURISTIC;
       AcceleratedHNSWParams.Builder paramsBuilder =
           new AcceleratedHNSWParams.Builder()
-              .withStrategy(AcceleratedHNSWParams.Strategy.HEURISTIC)
+              .withStrategy(strategy)
               .withWriterThreads(config.cuvsWriterThreads)
               .withIntermediateGraphDegree(config.cagraIntermediateGraphDegree)
               .withGraphDegree(config.cagraGraphDegree)
@@ -1149,28 +1426,18 @@ public class LuceneCuvsBenchmarks {
               .withCagraGraphBuildAlgo(
                   config.cagraGraphBuildAlgo != null
                       ? config.cagraGraphBuildAlgo
-                      : CagraGraphBuildAlgo.AUTO_SELECT);
+                      : CagraGraphBuildAlgo.AUTO_SELECT)
+              .withCuvsDistanceType(config.resolvedCuvsDistanceType());
 
-      // Native flat buffering is only wired for the CAGRA_HNSW writer and needs the whole dataset in
-      // one segment (the native host matrix is sized for the exact count). Fail fast on a
-      // multi-segment config rather than deep inside the writer.
-      if (config.cuvsNativeFlatBuffering && config.algoToRun.equals(Codex.CAGRA_HNSW)) {
-        if (config.flushFreq < numVectorsToIndex) {
-          throw new IllegalArgumentException(
-              "cuvsNativeFlatBuffering requires a single-segment build: set flushFreq >= "
-                  + numVectorsToIndex
-                  + " so all vectors land in one segment (got flushFreq="
-                  + config.flushFreq
-                  + ")");
-        }
-        log.info("<<< Native flat buffering enabled: numInputVectors={} >>>", numVectorsToIndex);
-        paramsBuilder.withNumInputVectors(numVectorsToIndex);
+      if (strategy == AcceleratedHNSWParams.Strategy.CUSTOM
+          && config.cagraGraphBuildAlgo == CagraGraphBuildAlgo.IVF_PQ) {
+        paramsBuilder.withCuVSIvfPqParams(buildCustomIvfPqParams(config, numVectorsToIndex));
       }
 
       AcceleratedHNSWParams params = paramsBuilder.build();
 
       if (config.algoToRun.equals(Codex.CAGRA_HNSW)) {
-        log.info("<<< Using Lucene101AcceleratedHNSWCodec (HEURISTIC strategy) >>>");
+        log.info("<<< Using Lucene101AcceleratedHNSWCodec ({} strategy) >>>", strategy);
         return new Lucene101AcceleratedHNSWCodec(params);
       } else if (config.algoToRun.equals(Codex.CAGRA_SEARCH)) {
         log.info("<<< Using CuVS2510GPUSearchCodec (HEURISTIC strategy) >>>");

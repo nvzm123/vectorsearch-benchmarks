@@ -45,11 +45,11 @@ public class ChunkedVectorProvider implements VectorProvider {
   private int chunkLen = 0; // number of vectors currently buffered
 
   public static boolean supports(String filePath) {
-    return !filePath.endsWith(".gz")
-        && (filePath.contains("fbin") || filePath.contains("fvecs"));
+    return !filePath.endsWith(".gz") && (filePath.contains("fbin") || filePath.contains("fvecs"));
   }
 
-  public ChunkedVectorProvider(String filePath, int maxVectors, int chunkSizeMB) throws IOException {
+  public ChunkedVectorProvider(String filePath, int maxVectors, int chunkSizeMB)
+      throws IOException {
     if (filePath.endsWith(".gz")) {
       throw new IllegalArgumentException("ChunkedVectorProvider does not support compressed files");
     }

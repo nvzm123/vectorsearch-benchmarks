@@ -68,6 +68,22 @@ public final class StageTimers {
     }
   }
 
+  /** Appends a stable, machine-readable snapshot to a benchmark result map. */
+  public static void appendMetrics(Map<String, Object> target, String prefix) {
+    NANOS.keySet().stream()
+        .sorted()
+        .forEach(
+            stage -> {
+              String key = prefix + "/" + stage;
+              target.put(key + "/seconds", NANOS.get(stage).sum() / 1e9);
+              target.put(key + "/count", COUNTS.getOrDefault(stage, new LongAdder()).sum());
+              LongAdder bytes = BYTES.get(stage);
+              if (bytes != null) {
+                target.put(key + "/bytes", bytes.sum());
+              }
+            });
+  }
+
   /** Prints accumulated stage totals (with throughput where bytes are known), sorted by time. */
   public static void dump(String header) {
     if (NANOS.isEmpty()) {
