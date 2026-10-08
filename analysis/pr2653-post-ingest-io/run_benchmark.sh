@@ -39,6 +39,10 @@ output_quiescence_max_kb=${OUTPUT_QUIESCENCE_MAX_KB:-262144}
 output_quiescence_timeout_sec=${OUTPUT_QUIESCENCE_TIMEOUT_SEC:-300}
 vector_row_copy_mode=${VECTOR_ROW_COPY_MODE:-bulk}
 require_idle_gpu=${BENCHMARK_REQUIRE_IDLE_GPU:-true}
+expect_hidden_gpu_control=${CUVS_EXPECT_HIDDEN_GPU_CONTROL:-false}
+frozen_native_helper=${CUVS_FROZEN_NATIVE_HELPER:-}
+native_artifact_dir=${CUVS_NATIVE_ARTIFACT_DIR:-}
+native_dependency_manifest=${CUVS_NATIVE_DEPENDENCY_MANIFEST:-}
 prewarm_index_before_search=${PREWARM_INDEX_BEFORE_SEARCH:-}
 enable_index_writer_info_stream=${ENABLE_INDEX_WRITER_INFO_STREAM:-}
 post_ingest_overlap=${CUVS_POST_INGEST_OVERLAP:-false}
@@ -86,6 +90,13 @@ case "$require_idle_gpu" in
   true|false) ;;
   *)
     echo "BENCHMARK_REQUIRE_IDLE_GPU must be true or false; got $require_idle_gpu" >&2
+    exit 2
+    ;;
+esac
+case "$expect_hidden_gpu_control" in
+  true|false) ;;
+  *)
+    echo "CUVS_EXPECT_HIDDEN_GPU_CONTROL must be true or false; got $expect_hidden_gpu_control" >&2
     exit 2
     ;;
 esac
@@ -175,6 +186,14 @@ if ! [[ "${EXPECTED_SEGMENT_COUNT:-0}" =~ ^[0-9]+$ ]]; then
   echo "EXPECTED_SEGMENT_COUNT must be a non-negative integer; got ${EXPECTED_SEGMENT_COUNT:-}" >&2
   exit 2
 fi
+for loader_variable in \
+  LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT LD_DEBUG LD_DEBUG_OUTPUT LD_PROFILE \
+  LD_PROFILE_OUTPUT LD_TRACE_LOADED_OBJECTS; do
+  if [[ -v "$loader_variable" ]]; then
+    echo "Unexpected inherited loader variable: $loader_variable" >&2
+    exit 4
+  fi
+done
 if [ -n "$required_index_free_bytes" ] && ! [[ "$required_index_free_bytes" =~ ^[0-9]+$ ]]; then
   echo "REQUIRED_INDEX_FREE_BYTES must be a non-negative integer; got $required_index_free_bytes" >&2
   exit 2
@@ -382,6 +401,14 @@ cuvs_java_jar=$(realpath "$cuvs_java_jar")
 native_dir=$(realpath "${CUVS_NATIVE_DIR:-/home/ec2-user/miniforge3/envs/cuvs-dev/lib}")
 libcuvs=$(realpath "$native_dir/libcuvs.so")
 libcuvs_c=$(realpath "$native_dir/libcuvs_c.so")
+if [ -z "$frozen_native_helper" ] || [ -z "$native_artifact_dir" ] \
+    || [ -z "$native_dependency_manifest" ]; then
+  echo "Frozen-native helper, artifact directory, and dependency manifest are required" >&2
+  exit 4
+fi
+frozen_native_helper=$(realpath "$frozen_native_helper")
+native_artifact_dir=$(realpath "$native_artifact_dir")
+native_dependency_manifest=$(realpath "$native_dependency_manifest")
 
 assert_artifact_fresh() {
   local artifact=$1
@@ -410,6 +437,8 @@ for required in \
   "$cuvs_java_jar" \
   "$libcuvs" \
   "$libcuvs_c" \
+  "$frozen_native_helper" \
+  "$native_dependency_manifest" \
   "$benchmark_root/target/classes/com/searchscale/lucene/cuvs/benchmarks/LuceneCuvsBenchmarks.class"; do
   if [ ! -f "$required" ]; then
     echo "Required artifact is missing: $required" >&2
@@ -445,7 +474,7 @@ fi
 mvn -q -f "$benchmark_root/pom.xml" "${maven_version_args[@]}" \
   -DincludeScope=runtime dependency:build-classpath -Dmdep.outputFile="$raw_classpath"
 runtime_classpath="$benchmark_root/target/classes:$cuvs_lucene_jar:$cuvs_java_jar"
-while IFS= read -r entry; do
+while IFS= read -r entry || [ -n "$entry" ]; do
   case "$(basename "$entry")" in
     cuvs-lucene-*.jar|cuvs-java-*.jar) continue ;;
   esac
@@ -556,6 +585,7 @@ stat -f "$dataset_file" "$index_dir" > "$results_dir/filesystem-stats-before.txt
   echo "source_cache_mode=$source_cache_mode"
   echo "host_lock_file=$host_lock_file"
   echo "require_idle_gpu=$require_idle_gpu"
+  echo "expect_hidden_gpu_control=$expect_hidden_gpu_control"
   echo "vector_row_copy_mode=$vector_row_copy_mode"
   echo "post_ingest_overlap=$post_ingest_overlap"
   echo "large_vector_write_extensions=$large_vector_write_extensions"
@@ -606,6 +636,15 @@ stat -f "$dataset_file" "$index_dir" > "$results_dir/filesystem-stats-before.txt
   echo "libcuvs_sha256=$(sha256sum "$libcuvs" | awk '{print $1}')"
   echo "libcuvs_c=$libcuvs_c"
   echo "libcuvs_c_sha256=$(sha256sum "$libcuvs_c" | awk '{print $1}')"
+  echo "frozen_native_helper=$frozen_native_helper"
+  echo "frozen_native_helper_sha256=$(sha256sum "$frozen_native_helper" | awk '{print $1}')"
+  echo "native_dependency_manifest=$native_dependency_manifest"
+  echo "native_dependency_manifest_sha256=$(sha256sum "$native_dependency_manifest" | awk '{print $1}')"
+  if [ -e /etc/ld.so.preload ] || [ -L /etc/ld.so.preload ]; then
+    echo "system_loader_preload=present"
+  else
+    echo "system_loader_preload=absent"
+  fi
   findmnt -T "$dataset_file" -o SOURCE,TARGET,FSTYPE,OPTIONS -n
   findmnt -T "$index_dir" -o SOURCE,TARGET,FSTYPE,OPTIONS -n
   java -version 2>&1 | head -n 1
@@ -768,9 +807,11 @@ for library in "$libcuvs" "$libcuvs_c"; do
   runtime_native_identity_before[$library]=$(stat -Lc '%d:%i:%s:%Y:%a' "$library")
   runtime_native_sha256_before[$library]=$(sha256sum "$library" | awk '{print $1}')
 done
-LD_LIBRARY_PATH="$native_dir" \
-LD_PRELOAD="$libcuvs:$libcuvs_c" \
-/usr/bin/time -v -o "$results_dir/process-time.txt" \
+env -u LD_AUDIT -u LD_DEBUG -u LD_DEBUG_OUTPUT -u LD_PROFILE \
+  -u LD_PROFILE_OUTPUT -u LD_TRACE_LOADED_OBJECTS \
+  LD_LIBRARY_PATH="$native_dir" \
+  LD_PRELOAD="$libcuvs:$libcuvs_c" \
+  /usr/bin/time -v -o "$results_dir/process-time.txt" \
   java "${BENCHMARK_JAVA_OPTIONS[@]}" \
     "${java_system_properties[@]}" \
     -cp "$runtime_classpath" \
@@ -779,10 +820,15 @@ LD_PRELOAD="$libcuvs:$libcuvs_c" \
     > "$results_dir/benchmark.log" 2>&1 &
 timed_pid=$!
 
+runtime_native_startup_maps="$results_dir/runtime-native-startup-maps.txt"
 runtime_native_maps="$results_dir/runtime-native-maps.txt"
 runtime_native_loaded="$results_dir/runtime-native-loaded.tsv"
 runtime_native_environ="$results_dir/runtime-native-environ.txt"
+runtime_startup_dependencies_loaded="$results_dir/runtime-startup-dependencies-loaded.tsv"
+runtime_shared_objects="$results_dir/runtime-shared-objects.tsv"
+runtime_maps_verification="$results_dir/runtime-maps-verification.json"
 runtime_map_capture_status=missing_java_process
+runtime_map_capture_phase=missing
 java_pid=
 java_executable=$(readlink -f "$(command -v java)")
 for ((map_attempt = 0; map_attempt < 300; map_attempt++)); do
@@ -803,16 +849,57 @@ for ((map_attempt = 0; map_attempt < 300; map_attempt++)); do
   sleep 0.1
 done
 
-if [ -n "$java_pid" ] && cp "/proc/$java_pid/maps" "$runtime_native_maps" 2>/dev/null \
+if [ -n "$java_pid" ] && cp "/proc/$java_pid/maps" "$runtime_native_startup_maps" 2>/dev/null \
     && { tr '\0' '\n' < "/proc/$java_pid/environ" \
-      | awk '/^(LD_PRELOAD|LD_LIBRARY_PATH|CUDA_VISIBLE_DEVICES)=/' > "$runtime_native_environ"; }; then
-  printf 'library\tcanonical_path\tdevice_decimal\tmap_device\tinode\tsize\tmtime\tsha256\tmapping_count\n' \
-    > "$runtime_native_loaded"
-  runtime_map_capture_status=verified
+      | awk '/^(LD_[A-Za-z0-9_]*|CUDA_VISIBLE_DEVICES)=/' | LC_ALL=C sort \
+      > "$runtime_native_environ"; }; then
+  runtime_map_capture_status=captured_startup
   if ! grep -Fxq "LD_PRELOAD=$libcuvs:$libcuvs_c" "$runtime_native_environ" \
       || ! grep -Fxq "LD_LIBRARY_PATH=$native_dir" "$runtime_native_environ" \
-      || grep -q '^CUDA_VISIBLE_DEVICES=' "$runtime_native_environ"; then
+      || [ "$(grep -c '^LD_' "$runtime_native_environ")" -ne 2 ]; then
     runtime_map_capture_status=unexpected_native_environment
+  fi
+  if [ "$expect_hidden_gpu_control" = true ]; then
+    grep -Fxq 'CUDA_VISIBLE_DEVICES=-1' "$runtime_native_environ" || \
+      runtime_map_capture_status=unexpected_native_environment
+  elif grep -q '^CUDA_VISIBLE_DEVICES=' "$runtime_native_environ"; then
+    runtime_map_capture_status=unexpected_native_environment
+  fi
+  if [ "$expect_hidden_gpu_control" = true ]; then
+    if cp "$runtime_native_startup_maps" "$runtime_native_maps"; then
+      runtime_map_capture_phase=startup_negative_control
+    else
+      runtime_map_capture_status=map_copy_failed
+    fi
+  else
+    for ((provider_attempt = 0; provider_attempt < 1200; provider_attempt++)); do
+      if grep -Fq '<<< cuVS provider and RMM async memory initialized >>>' \
+          "$results_dir/benchmark.log" 2>/dev/null; then
+        if cp "/proc/$java_pid/maps" "$runtime_native_maps" 2>/dev/null; then
+          runtime_map_capture_phase=post_provider_initialization
+        else
+          runtime_map_capture_status=post_provider_map_copy_failed
+        fi
+        break
+      fi
+      kill -0 "$java_pid" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [ "$runtime_map_capture_phase" != post_provider_initialization ] \
+        && [ "$runtime_map_capture_status" = captured_startup ]; then
+      runtime_map_capture_status=missing_provider_initialization_marker
+    fi
+  fi
+fi
+
+wait "$timed_pid"
+java_status=$?
+status=$java_status
+if [ -f "$runtime_native_maps" ]; then
+  printf 'library\tcanonical_path\tdevice_decimal\tmap_device\tinode\tsize\tmtime\tsha256\tmapping_count\n' \
+    > "$runtime_native_loaded"
+  if [ "$runtime_map_capture_status" = captured_startup ]; then
+    runtime_map_capture_status=verified
   fi
   for library in "$libcuvs" "$libcuvs_c"; do
     read -r device inode size mtime < <(stat -Lc '%d %i %s %Y' "$library")
@@ -825,20 +912,27 @@ if [ -n "$java_pid" ] && cp "/proc/$java_pid/maps" "$runtime_native_maps" 2>/dev
     fi
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$(basename "$library")" "$library" "$device" "$map_device" "$inode" "$size" "$mtime" \
-      "$(sha256sum "$library" | awk '{print $1}')" "$mapping_count" \
+      "${runtime_native_sha256_before[$library]}" "$mapping_count" \
       >> "$runtime_native_loaded"
   done
-  alternate_mapping_count=$(awk -v libcuvs="$libcuvs" -v libcuvs_c="$libcuvs_c" \
-    '$6 ~ /\/libcuvs(_c)?\.so($|\.)/ && !(NF == 6 && ($6 == libcuvs || $6 == libcuvs_c)) { count++ }
-     END { print count + 0 }' "$runtime_native_maps")
-  if [ "$alternate_mapping_count" -ne 0 ]; then
-    runtime_map_capture_status=alternate_native_mapping
+  if ! python3 "$frozen_native_helper" verify-maps \
+      --maps "$runtime_native_maps" \
+      --native-dir "$native_dir" \
+      --artifact-dir "$native_artifact_dir" \
+      --startup-output "$runtime_startup_dependencies_loaded" \
+      --shared-output "$runtime_shared_objects" \
+      > "$runtime_maps_verification" 2> "$results_dir/runtime-maps-verification.stderr"; then
+    runtime_map_capture_status=map_dependency_verification_failed
+  elif [ "$expect_hidden_gpu_control" = false ]; then
+    if ! awk -F '\t' 'NR > 1 && $NF == "cuda_driver" { found=1 } END { exit !found }' \
+        "$runtime_shared_objects"; then
+      runtime_map_capture_status=missing_cuda_driver_mapping
+    elif ! awk -F '\t' 'NR > 1 && $NF == "cuda_runtime" { found=1 } END { exit !found }' \
+        "$runtime_shared_objects"; then
+      runtime_map_capture_status=missing_cuda_runtime_mapping
+    fi
   fi
 fi
-
-wait "$timed_pid"
-java_status=$?
-status=$java_status
 for library in "$libcuvs" "$libcuvs_c"; do
   identity_after=$(stat -Lc '%d:%i:%s:%Y:%a' "$library")
   sha256_after=$(sha256sum "$library" | awk '{print $1}')
@@ -857,6 +951,7 @@ set -e
   echo "runtime_java_pid=${java_pid:-not-captured}"
   echo "runtime_java_executable=$java_executable"
   echo "runtime_native_map_capture_status=$runtime_map_capture_status"
+  echo "runtime_native_map_capture_phase=$runtime_map_capture_phase"
   if [ -f "$runtime_native_environ" ]; then
     echo "runtime_native_environ_sha256=$(sha256sum "$runtime_native_environ" | awk '{print $1}')"
   else
@@ -867,10 +962,30 @@ set -e
   else
     echo "runtime_native_maps_sha256=missing"
   fi
+  if [ -f "$runtime_native_startup_maps" ]; then
+    echo "runtime_native_startup_maps_sha256=$(sha256sum "$runtime_native_startup_maps" | awk '{print $1}')"
+  else
+    echo "runtime_native_startup_maps_sha256=missing"
+  fi
   if [ -f "$runtime_native_loaded" ]; then
     echo "runtime_native_loaded_sha256=$(sha256sum "$runtime_native_loaded" | awk '{print $1}')"
   else
     echo "runtime_native_loaded_sha256=missing"
+  fi
+  if [ -f "$runtime_startup_dependencies_loaded" ]; then
+    echo "runtime_startup_dependencies_loaded_sha256=$(sha256sum "$runtime_startup_dependencies_loaded" | awk '{print $1}')"
+  else
+    echo "runtime_startup_dependencies_loaded_sha256=missing"
+  fi
+  if [ -f "$runtime_shared_objects" ]; then
+    echo "runtime_shared_objects_sha256=$(sha256sum "$runtime_shared_objects" | awk '{print $1}')"
+  else
+    echo "runtime_shared_objects_sha256=missing"
+  fi
+  if [ -f "$runtime_maps_verification" ]; then
+    echo "runtime_maps_verification_sha256=$(sha256sum "$runtime_maps_verification" | awk '{print $1}')"
+  else
+    echo "runtime_maps_verification_sha256=missing"
   fi
 } >> "$results_dir/provenance.txt"
 

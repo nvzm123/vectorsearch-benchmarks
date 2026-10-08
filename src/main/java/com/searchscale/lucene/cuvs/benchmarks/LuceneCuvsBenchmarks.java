@@ -408,6 +408,7 @@ public class LuceneCuvsBenchmarks {
       // search on the CPU. CAGRA_SEARCH needs the GPU during search as well.
       if (requiresGpuInitialization(config)) {
         CuVSProvider.provider().enableRMMAsyncMemory();
+        log.info("<<< cuVS provider and RMM async memory initialized >>>");
       }
       if (!config.skipIndexing) {
         int numVectorsToIndex = Math.min(config.numDocs, vectorProvider.size());
