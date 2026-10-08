@@ -379,9 +379,9 @@ fi
 cuvs_lucene_jar=${CUVS_LUCENE_JAR:-$cuvs_root/java/cuvs-lucene/target/cuvs-lucene-26.12.0.jar}
 cuvs_java_jar=${CUVS_JAVA_JAR:-$cuvs_root/java/cuvs-java/target/cuvs-java-26.12.0.jar}
 cuvs_java_jar=$(realpath "$cuvs_java_jar")
-native_dir=${CUVS_NATIVE_DIR:-/home/ec2-user/miniforge3/envs/cuvs-dev/lib}
-libcuvs="$native_dir/libcuvs.so"
-libcuvs_c="$native_dir/libcuvs_c.so"
+native_dir=$(realpath "${CUVS_NATIVE_DIR:-/home/ec2-user/miniforge3/envs/cuvs-dev/lib}")
+libcuvs=$(realpath "$native_dir/libcuvs.so")
+libcuvs_c=$(realpath "$native_dir/libcuvs_c.so")
 
 assert_artifact_fresh() {
   local artifact=$1
@@ -764,11 +764,73 @@ LD_PRELOAD="$libcuvs:$libcuvs_c" \
     -cp "$runtime_classpath" \
     com.searchscale.lucene.cuvs.benchmarks.LuceneCuvsBenchmarks \
     "$config_file" "$benchmark_id" "$results_dir" \
-    > "$results_dir/benchmark.log" 2>&1
-status=$?
-java_status=$status
+    > "$results_dir/benchmark.log" 2>&1 &
+timed_pid=$!
+
+runtime_native_maps="$results_dir/runtime-native-maps.txt"
+runtime_native_loaded="$results_dir/runtime-native-loaded.tsv"
+runtime_map_capture_status=missing_java_process
+java_pid=
+java_executable=$(readlink -f "$(command -v java)")
+for ((map_attempt = 0; map_attempt < 300; map_attempt++)); do
+  candidates=("$timed_pid")
+  children_file="/proc/$timed_pid/task/$timed_pid/children"
+  if [ -r "$children_file" ]; then
+    read -r -a child_pids < "$children_file"
+    candidates+=("${child_pids[@]}")
+  fi
+  for candidate in "${candidates[@]}"; do
+    candidate_executable=$(readlink -f "/proc/$candidate/exe" 2>/dev/null)
+    if [ "$candidate_executable" = "$java_executable" ]; then
+      java_pid=$candidate
+      break 2
+    fi
+  done
+  kill -0 "$timed_pid" 2>/dev/null || break
+  sleep 0.1
+done
+
+if [ -n "$java_pid" ] && cp "/proc/$java_pid/maps" "$runtime_native_maps" 2>/dev/null; then
+  printf 'library\tcanonical_path\tdevice\tinode\tsize\tmtime\tsha256\tmapping_count\n' \
+    > "$runtime_native_loaded"
+  runtime_map_capture_status=verified
+  for library in "$libcuvs" "$libcuvs_c"; do
+    read -r device inode size mtime < <(stat -Lc '%d %i %s %Y' "$library")
+    mapping_count=$(grep -Fc " $library" "$runtime_native_maps")
+    if [ "$mapping_count" -eq 0 ]; then
+      runtime_map_capture_status=missing_native_mapping
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$(basename "$library")" "$library" "$device" "$inode" "$size" "$mtime" \
+      "$(sha256sum "$library" | awk '{print $1}')" "$mapping_count" \
+      >> "$runtime_native_loaded"
+  done
+fi
+
+wait "$timed_pid"
+java_status=$?
+status=$java_status
+if [ "$runtime_map_capture_status" != verified ] && [ "$status" -eq 0 ]; then
+  status=11
+fi
 java_end_ns=$(date +%s%N)
 set -e
+
+{
+  echo "runtime_java_pid=${java_pid:-not-captured}"
+  echo "runtime_java_executable=$java_executable"
+  echo "runtime_native_map_capture_status=$runtime_map_capture_status"
+  if [ -f "$runtime_native_maps" ]; then
+    echo "runtime_native_maps_sha256=$(sha256sum "$runtime_native_maps" | awk '{print $1}')"
+  else
+    echo "runtime_native_maps_sha256=missing"
+  fi
+  if [ -f "$runtime_native_loaded" ]; then
+    echo "runtime_native_loaded_sha256=$(sha256sum "$runtime_native_loaded" | awk '{print $1}')"
+  else
+    echo "runtime_native_loaded_sha256=missing"
+  fi
+} >> "$results_dir/provenance.txt"
 
 stop_proactive_sync
 stop_monitors
