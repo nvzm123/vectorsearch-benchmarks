@@ -25,7 +25,6 @@ public class BenchmarkConfiguration {
   public int topK;
   public int numIndexThreads;
   public int cuvsWriterThreads;
-  public int cuvsGraphThreads = 1;
   public int queryThreads;
   public boolean dropPageCacheBeforeSearch = false;
   public boolean prewarmIndexBeforeSearch = true;
@@ -226,7 +225,6 @@ public class BenchmarkConfiguration {
       sb.append("cagraIntermediateGraphDegree: ").append(cagraIntermediateGraphDegree).append('\n');
       sb.append("cagraGraphDegree: ").append(cagraGraphDegree).append('\n');
       sb.append("cuvsWriterThreads: ").append(cuvsWriterThreads).append('\n');
-      sb.append("cuvsGraphThreads: ").append(cuvsGraphThreads).append('\n');
       sb.append("cagraITopK: ").append(cagraITopK).append('\n');
       sb.append("cagraSearchWidth: ").append(cagraSearchWidth).append('\n');
       sb.append("cagraHnswLayers: ").append(cagraHnswLayers).append('\n');

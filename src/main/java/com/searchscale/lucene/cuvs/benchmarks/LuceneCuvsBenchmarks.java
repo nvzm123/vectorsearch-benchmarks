@@ -44,8 +44,8 @@ import org.apache.lucene.codecs.Codec;
 import org.apache.lucene.codecs.KnnVectorsFormat;
 import org.apache.lucene.codecs.KnnVectorsReader;
 import org.apache.lucene.codecs.KnnVectorsWriter;
-import org.apache.lucene.codecs.lucene101.Lucene101Codec;
-import org.apache.lucene.codecs.lucene101.Lucene101Codec.Mode;
+import org.apache.lucene.codecs.lucene104.Lucene104Codec;
+import org.apache.lucene.codecs.lucene104.Lucene104Codec.Mode;
 import org.apache.lucene.codecs.lucene99.Lucene99HnswVectorsFormat;
 import org.apache.lucene.document.Document;
 import org.apache.lucene.document.Field;
@@ -1390,8 +1390,8 @@ public class LuceneCuvsBenchmarks {
   private static Codec getCodec(BenchmarkConfiguration config, int numVectorsToIndex)
       throws Exception {
     if (config.algoToRun.equals(Codex.LUCENE_HNSW)) {
-      log.info("<<< Using Lucene101Codec >>>");
-      return new Lucene101Codec(Mode.BEST_SPEED) {
+      log.info("<<< Using Lucene104Codec >>>");
+      return new Lucene104Codec(Mode.BEST_SPEED) {
         @Override
         public KnnVectorsFormat getKnnVectorsFormatForField(String field) {
           KnnVectorsFormat knnFormat;
@@ -1435,6 +1435,7 @@ public class LuceneCuvsBenchmarks {
       }
 
       AcceleratedHNSWParams params = paramsBuilder.build();
+      log.info("<<< Resolved AcceleratedHNSWParams: {} >>>", params);
 
       if (config.algoToRun.equals(Codex.CAGRA_HNSW)) {
         log.info("<<< Using Lucene101AcceleratedHNSWCodec ({} strategy) >>>", strategy);
