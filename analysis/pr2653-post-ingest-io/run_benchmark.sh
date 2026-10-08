@@ -756,7 +756,19 @@ fi
 
 set +e
 java_start_ns=$(date +%s%N)
-LD_LIBRARY_PATH="$native_dir:${LD_LIBRARY_PATH:-}" \
+declare -A runtime_native_inode_before=()
+declare -A runtime_native_device_before=()
+declare -A runtime_native_identity_before=()
+declare -A runtime_native_sha256_before=()
+for library in "$libcuvs" "$libcuvs_c"; do
+  runtime_native_inode_before[$library]=$(stat -Lc '%i' "$library")
+  runtime_native_device_before[$library]=$(python3 -c \
+    'import os, sys; value = os.stat(sys.argv[1]).st_dev; print(f"{os.major(value):x}:{os.minor(value):02x}")' \
+    "$library")
+  runtime_native_identity_before[$library]=$(stat -Lc '%d:%i:%s:%Y:%a' "$library")
+  runtime_native_sha256_before[$library]=$(sha256sum "$library" | awk '{print $1}')
+done
+LD_LIBRARY_PATH="$native_dir" \
 LD_PRELOAD="$libcuvs:$libcuvs_c" \
 /usr/bin/time -v -o "$results_dir/process-time.txt" \
   java "${BENCHMARK_JAVA_OPTIONS[@]}" \
@@ -769,6 +781,7 @@ timed_pid=$!
 
 runtime_native_maps="$results_dir/runtime-native-maps.txt"
 runtime_native_loaded="$results_dir/runtime-native-loaded.tsv"
+runtime_native_environ="$results_dir/runtime-native-environ.txt"
 runtime_map_capture_status=missing_java_process
 java_pid=
 java_executable=$(readlink -f "$(command -v java)")
@@ -790,31 +803,50 @@ for ((map_attempt = 0; map_attempt < 300; map_attempt++)); do
   sleep 0.1
 done
 
-if [ -n "$java_pid" ] && cp "/proc/$java_pid/maps" "$runtime_native_maps" 2>/dev/null; then
-  printf 'library\tcanonical_path\tdevice\tinode\tsize\tmtime\tsha256\tmapping_count\n' \
+if [ -n "$java_pid" ] && cp "/proc/$java_pid/maps" "$runtime_native_maps" 2>/dev/null \
+    && { tr '\0' '\n' < "/proc/$java_pid/environ" \
+      | awk '/^(LD_PRELOAD|LD_LIBRARY_PATH|CUDA_VISIBLE_DEVICES)=/' > "$runtime_native_environ"; }; then
+  printf 'library\tcanonical_path\tdevice_decimal\tmap_device\tinode\tsize\tmtime\tsha256\tmapping_count\n' \
     > "$runtime_native_loaded"
   runtime_map_capture_status=verified
+  if ! grep -Fxq "LD_PRELOAD=$libcuvs:$libcuvs_c" "$runtime_native_environ" \
+      || ! grep -Fxq "LD_LIBRARY_PATH=$native_dir" "$runtime_native_environ" \
+      || grep -q '^CUDA_VISIBLE_DEVICES=' "$runtime_native_environ"; then
+    runtime_map_capture_status=unexpected_native_environment
+  fi
   for library in "$libcuvs" "$libcuvs_c"; do
     read -r device inode size mtime < <(stat -Lc '%d %i %s %Y' "$library")
-    map_device=$(python3 -c \
-      'import os, sys; value = os.stat(sys.argv[1]).st_dev; print(f"{os.major(value):x}:{os.minor(value):02x}")' \
-      "$library")
+    map_device=${runtime_native_device_before[$library]}
     mapping_count=$(awk -v path="$library" -v device="$map_device" -v inode="$inode" \
-      '$4 == device && $5 == inode && $6 == path { count++ } END { print count + 0 }' \
+      'NF == 6 && $4 == device && $5 == inode && $6 == path { count++ } END { print count + 0 }' \
       "$runtime_native_maps")
     if [ "$mapping_count" -eq 0 ]; then
       runtime_map_capture_status=missing_native_mapping
     fi
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$(basename "$library")" "$library" "$device" "$inode" "$size" "$mtime" \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$(basename "$library")" "$library" "$device" "$map_device" "$inode" "$size" "$mtime" \
       "$(sha256sum "$library" | awk '{print $1}')" "$mapping_count" \
       >> "$runtime_native_loaded"
   done
+  alternate_mapping_count=$(awk -v libcuvs="$libcuvs" -v libcuvs_c="$libcuvs_c" \
+    '$6 ~ /\/libcuvs(_c)?\.so($|\.)/ && !(NF == 6 && ($6 == libcuvs || $6 == libcuvs_c)) { count++ }
+     END { print count + 0 }' "$runtime_native_maps")
+  if [ "$alternate_mapping_count" -ne 0 ]; then
+    runtime_map_capture_status=alternate_native_mapping
+  fi
 fi
 
 wait "$timed_pid"
 java_status=$?
 status=$java_status
+for library in "$libcuvs" "$libcuvs_c"; do
+  identity_after=$(stat -Lc '%d:%i:%s:%Y:%a' "$library")
+  sha256_after=$(sha256sum "$library" | awk '{print $1}')
+  if [ "$identity_after" != "${runtime_native_identity_before[$library]}" ] \
+      || [ "$sha256_after" != "${runtime_native_sha256_before[$library]}" ]; then
+    runtime_map_capture_status=native_changed_after_launch
+  fi
+done
 if [ "$runtime_map_capture_status" != verified ] && [ "$status" -eq 0 ]; then
   status=11
 fi
@@ -825,6 +857,11 @@ set -e
   echo "runtime_java_pid=${java_pid:-not-captured}"
   echo "runtime_java_executable=$java_executable"
   echo "runtime_native_map_capture_status=$runtime_map_capture_status"
+  if [ -f "$runtime_native_environ" ]; then
+    echo "runtime_native_environ_sha256=$(sha256sum "$runtime_native_environ" | awk '{print $1}')"
+  else
+    echo "runtime_native_environ_sha256=missing"
+  fi
   if [ -f "$runtime_native_maps" ]; then
     echo "runtime_native_maps_sha256=$(sha256sum "$runtime_native_maps" | awk '{print $1}')"
   else
